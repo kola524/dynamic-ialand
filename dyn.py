@@ -2,14 +2,17 @@ import sys
 import ctypes
 import calendar
 import asyncio
+import time
 import psutil
+from contextlib import suppress
 from datetime import datetime
 
 from PyQt6.QtCore import (
-    Qt, QTimer, QPoint, QRect, QRectF, QThread, pyqtSignal, QEvent,
+    Qt, QTimer, QPoint, QRect, QRectF, QSize, QBuffer, QIODevice, QThread, pyqtSignal, QEvent,
     QVariantAnimation, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
 )
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QImage, QLinearGradient, QPen
+from PyQt6.QtGui import (QColor, QPainter, QPainterPath, QPixmap, QImage,
+                        QImageReader, QImageIOHandler, QLinearGradient, QPen)
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QStackedWidget, QProgressBar, QPlainTextEdit, QFrame
@@ -31,6 +34,28 @@ except ImportError:
         MEDIA_BACKEND = None
 
 
+# Decode a small image before sending it to the GUI; never queue full-size covers.
+MAX_COVER_BYTES = 4 * 1024 * 1024
+
+
+def decode_cover(raw_bytes):
+    if not raw_bytes or len(raw_bytes) > MAX_COVER_BYTES:
+        return QImage()
+    buffer = QBuffer()
+    buffer.setData(raw_bytes)
+    buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+    reader = QImageReader(buffer)
+    dimensions = reader.size()
+    if not dimensions.isValid():
+        return QImage()
+    pixels = dimensions.width() * dimensions.height()
+    native_scaling = reader.supportsOption(QImageIOHandler.ImageOption.ScaledSize)
+    if pixels > (64_000_000 if native_scaling else 8_000_000):
+        return QImage()
+    reader.setScaledSize(dimensions.scaled(QSize(128, 128), Qt.AspectRatioMode.KeepAspectRatio))
+    return reader.read()
+
+
 # --- Поток для асинхронного чтения медиа из Windows ---
 class MediaWorker(QThread):
     media_updated = pyqtSignal(dict)
@@ -41,6 +66,11 @@ class MediaWorker(QThread):
         self._action = None
         self._loop = None
         self._task = None
+        self._manager = None
+        self._track_key = None
+        self._thumbnail_loaded = False
+        self._thumbnail_retry_after = 0
+        self.load_artwork = False
 
     def stop(self):
         self.running = False
@@ -59,10 +89,11 @@ class MediaWorker(QThread):
         self._action = action_name
 
     async def _read_thumbnail_bytes(self, thumb_ref):
+        stream = reader = None
         try:
             stream = await thumb_ref.open_read_async()
             size = int(stream.size)
-            if size <= 0:
+            if size <= 0 or size > MAX_COVER_BYTES:
                 return None
 
             reader = DataReader(stream)
@@ -74,13 +105,22 @@ class MediaWorker(QThread):
                     reader.read_bytes(buf)
                     return bytes(buf)
                 except TypeError:
-                    return bytes([reader.read_byte() for _ in range(size)])
+                    return bytes(reader.read_byte() for _ in range(size))
             else:
                 buf = bytearray(size)
                 reader.read_bytes(buf)
                 return bytes(buf)
         except Exception:
             return None
+        finally:
+            if reader is not None:
+                with suppress(Exception):
+                    reader.detach_stream()
+                with suppress(Exception):
+                    reader.close()
+            if stream is not None:
+                with suppress(Exception):
+                    stream.close()
 
     async def _fetch_media(self):
         if MEDIA_BACKEND is None:
@@ -93,9 +133,12 @@ class MediaWorker(QThread):
             }
 
         try:
-            manager = await MediaManager.request_async()
-            session = manager.get_current_session()
+            if self._manager is None:
+                self._manager = await MediaManager.request_async()
+            session = self._manager.get_current_session()
             if not session:
+                self._track_key = None
+                self._thumbnail_loaded = False
                 return {
                     "title": "Ничего не играет",
                     "artist": "Включите музыку в браузере",
@@ -132,9 +175,22 @@ class MediaWorker(QThread):
             pos = timeline.position.total_seconds() if timeline and timeline.position else 0
             end = timeline.end_time.total_seconds() if timeline and timeline.end_time else 0
 
-            thumb_bytes = None
-            if props and props.thumbnail:
-                thumb_bytes = await self._read_thumbnail_bytes(props.thumbnail)
+            track_key = (str(session.source_app_user_model_id), title, artist,
+                         getattr(props, "album_title", ""))
+            artwork = {}
+            if track_key != self._track_key:
+                self._track_key = track_key
+                self._thumbnail_loaded = False
+                self._thumbnail_retry_after = 0
+                artwork["thumb"] = None  # Clear the previous track's cover.
+            if (self.load_artwork and not self._thumbnail_loaded and props
+                    and props.thumbnail and time.monotonic() >= self._thumbnail_retry_after):
+                self._thumbnail_retry_after = time.monotonic() + 10
+                raw = await self._read_thumbnail_bytes(props.thumbnail)
+                cover = decode_cover(raw)
+                if not cover.isNull():
+                    artwork["thumb"] = cover
+                    self._thumbnail_loaded = True
 
             return {
                 "title": title,
@@ -143,9 +199,11 @@ class MediaWorker(QThread):
                 "is_playing": is_playing,
                 "pos": pos,
                 "end": end,
-                "thumb": thumb_bytes
+                **artwork
             }
         except Exception as e:
+            self._manager = None
+            self._track_key = None
             return {
                 "title": "Ожидание плеера...",
                 "artist": str(e)[:32],
@@ -171,6 +229,8 @@ class MediaWorker(QThread):
                 break
             except Exception:
                 pass
+            finally:
+                self._task = None
             for _ in range(8):
                 if not self.running:
                     break
@@ -192,6 +252,8 @@ class MediaButton(QPushButton):
         self.set_symbol(symbol, label)
 
     def set_symbol(self, symbol, label):
+        if self.symbol == symbol and self.toolTip() == label:
+            return
         self.symbol = symbol
         self.setToolTip(label)
         self.setAccessibleName(label)
@@ -338,6 +400,9 @@ class SlidingStackedWidget(QStackedWidget):
             curr_widget.hide()
             curr_widget.move(0, 0)
             self._animating = False
+            group = self.anim_group
+            self.anim_group = None
+            group.deleteLater()
 
         self.anim_group.finished.connect(on_finished)
         self.anim_group.start()
@@ -357,6 +422,7 @@ class DesktopIslandWidget(QWidget):
         self._closing = False
         self._media_title = "Ничего не играет"
         self._media_playing = False
+        self._mini_telegram_mode = None
         self.telegram_messages = []
         self.telegram_unseen = set()
         self.telegram_index = 0
@@ -398,13 +464,12 @@ class DesktopIslandWidget(QWidget):
 
         self.pc_timer = QTimer(self)
         self.pc_timer.timeout.connect(self.update_pc_stats)
-        self.pc_timer.start(1500)
+        self.pc_timer.start(5000)
         self.update_pc_stats()
 
         # Глобальный детектор клика мимо окна (например, по рабочему столу)
         self.outside_click_timer = QTimer(self)
         self.outside_click_timer.timeout.connect(self._check_global_outside_click)
-        self.outside_click_timer.start(40)
 
     def _make_children_click_through(self, parent_widget):
         for child in parent_widget.findChildren(QWidget):
@@ -755,25 +820,33 @@ class DesktopIslandWidget(QWidget):
     def on_page_changed(self, index):
         self.update_dots(index)
         self.mark_telegram_viewed()
+        if hasattr(self, "media_worker"):
+            self.media_worker.load_artwork = self.is_expanded and index == 0
+            self.update_pc_stats()
 
     def refresh_collapsed_view(self):
+        telegram_mode = bool(self.telegram_unseen)
+        if telegram_mode != self._mini_telegram_mode:
+            self._mini_telegram_mode = telegram_mode
+            self.mini_icon.setStyleSheet(
+                "font-size: 10px; font-weight: 800; color: #61c7fa;" if telegram_mode
+                else "font-size: 12px; color: #ff2a85;"
+            )
         if self.telegram_unseen:
             message = next(m for m in self.telegram_messages if m["key"] in self.telegram_unseen)
             self.mini_icon.setText("TG")
-            self.mini_icon.setStyleSheet("font-size: 10px; font-weight: 800; color: #61c7fa;")
             self.mini_title.setText(self.mini_title.fontMetrics().elidedText(
                 message["sender"], Qt.TextElideMode.ElideRight, 140
             ))
             self.mini_time.setText(f"+{len(self.telegram_unseen)}")
         else:
             self.mini_icon.setText("♫" if self._media_playing else "●")
-            self.mini_icon.setStyleSheet("font-size: 12px; color: #ff2a85;")
             self.mini_title.setText(self._media_title[:18] + "…" if len(self._media_title) > 18 else self._media_title)
             self.mini_time.setText(datetime.now().strftime("%H:%M"))
 
     @staticmethod
     def make_rounded_pixmap(raw_bytes: bytes, size: int = 64, radius: int = 14) -> QPixmap:
-        img = QImage.fromData(raw_bytes)
+        img = raw_bytes if isinstance(raw_bytes, QImage) else decode_cover(raw_bytes)
         if img.isNull():
             return QPixmap()
 
@@ -831,19 +904,25 @@ class DesktopIslandWidget(QWidget):
             self.time_cur_lbl.setText("0:00")
             self.time_rem_lbl.setText("-0:00")
 
-        if data["thumb"]:
+        if "thumb" not in data:
+            return  # The track's cover is unchanged; keep the small pixmap.
+        if data["thumb"] is not None:
             rounded_pix = self.make_rounded_pixmap(data["thumb"], size=64, radius=14)
             if not rounded_pix.isNull():
                 self.cover_label.setStyleSheet("background-color: transparent;")
                 self.cover_label.setPixmap(rounded_pix)
                 return
 
+        if self.cover_label.text() == "♪":
+            return
         self.cover_label.clear()
         self.cover_label.setStyleSheet("background-color: #262630; border-radius: 14px; font-size: 24px; color: #ff2a85;")
         self.cover_label.setText("♪")
 
     def update_pc_stats(self):
         self.refresh_collapsed_view()
+        if not self.is_expanded or self.stack.currentIndex() != 2:
+            return
 
         cpu = psutil.cpu_percent()
         ram = psutil.virtual_memory()
@@ -893,6 +972,15 @@ class DesktopIslandWidget(QWidget):
                 self.render_telegram_message()
                 self.stack.setCurrentIndex(self.telegram_page_index)
             self.activateWindow()
+
+        self.media_worker.load_artwork = self.is_expanded and self.stack.currentIndex() == 0
+        self.pc_timer.setInterval(1500 if self.is_expanded else 5000)
+        if self.is_expanded:
+            self.outside_click_timer.start(40)
+            self.update_pc_stats()
+        else:
+            self.outside_click_timer.stop()
+            self._was_outside_pressed = False
 
         self.collapsed_widget.hide()
         self.expanded_widget.hide()

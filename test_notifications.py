@@ -2,16 +2,19 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import sqlite3
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock, Mock
+from types import SimpleNamespace
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QCoreApplication, QEvent, QBuffer, QIODevice
+from PyQt6.QtGui import QImage, QColor
 from PyQt6.QtTest import QTest
 
 import dyn
-from telegram_notifications import TelegramNotificationReader, parse_toast, windows_filetime
+from telegram_notifications import TelegramNotificationReader, parse_toast, windows_filetime, MAX_TOAST_BYTES
 
 
 def toast(sender="Анна", body="Привет!", subtitle=""):
@@ -82,6 +85,14 @@ class NotificationReaderTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             TelegramNotificationReader(path).poll()
         self.assertFalse(path.exists())
+
+    def test_large_payload_is_skipped_and_burst_keeps_latest_twenty(self):
+        self.insert(1, payload=b'x' * (MAX_TOAST_BYTES + 1))
+        for i in range(2, 32):
+            self.insert(i, payload=toast(body=str(i)))
+        messages = self.reader.poll()
+        self.assertEqual([m['body'] for m in messages], [str(i) for i in range(12, 32)])
+        self.assertEqual(self.reader.poll(), [])
 
 
 class IslandInteractionTests(unittest.TestCase):
@@ -160,6 +171,93 @@ class IslandInteractionTests(unittest.TestCase):
         self.assertEqual(len(self.island.telegram_messages), 20)
         self.assertEqual(len(self.island.telegram_unseen), 20)
         self.assertEqual(self.island.stack.currentIndex(), 0)
+
+    def test_finished_animations_do_not_accumulate(self):
+        self.island.expand_island()
+        self.finish_resize()
+        for _ in range(200):
+            stack = self.island.stack
+            stack.slide_to_index((stack.currentIndex() + 1) % stack.count())
+            stack.anim_group.setCurrentTime(320)
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.assertEqual(self.island.stack.findChildren(dyn.QParallelAnimationGroup), [])
+        self.assertEqual(self.island.stack.findChildren(dyn.QPropertyAnimation), [])
+
+    def test_background_work_follows_visible_page(self):
+        self.assertFalse(self.island.media_worker.load_artwork)
+        self.island.expand_island()
+        self.finish_resize()
+        self.assertTrue(self.island.media_worker.load_artwork)
+        self.island.stack.setCurrentIndex(2)
+        self.assertFalse(self.island.media_worker.load_artwork)
+        self.island.collapse_island()
+        self.finish_resize()
+        self.assertFalse(self.island.outside_click_timer.isActive())
+
+
+class ArtworkMemoryTests(unittest.TestCase):
+    @staticmethod
+    def encoded_cover():
+        image = QImage(512, 256, QImage.Format.Format_RGB32)
+        image.fill(QColor('red'))
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buffer, 'JPEG')
+        return bytes(buffer.data())
+
+    def test_cover_is_decoded_to_small_image(self):
+        image = dyn.decode_cover(self.encoded_cover())
+        self.assertEqual((image.width(), image.height()), (128, 64))
+        self.assertLessEqual(image.sizeInBytes(), 128 * 128 * 4)
+        self.assertTrue(dyn.decode_cover(b'not an image').isNull())
+        self.assertTrue(dyn.decode_cover(b'x' * (dyn.MAX_COVER_BYTES + 1)).isNull())
+
+    def test_cover_is_only_read_once_per_track_when_player_visible(self):
+        async def scenario():
+            worker = dyn.MediaWorker()
+            props = SimpleNamespace(title='Track', artist='Artist', album_title='Album', thumbnail=object())
+            session = SimpleNamespace(
+                source_app_user_model_id='Player',
+                try_get_media_properties_async=AsyncMock(return_value=props),
+                get_playback_info=lambda: SimpleNamespace(playback_status=4),
+                get_timeline_properties=lambda: None,
+            )
+            manager = SimpleNamespace(get_current_session=lambda: session)
+            manager_type = SimpleNamespace(request_async=AsyncMock(return_value=manager))
+            with patch.object(dyn, 'MEDIA_BACKEND', 'winrt'), \
+                    patch.object(dyn, 'MediaManager', manager_type, create=True), \
+                    patch.object(worker, '_read_thumbnail_bytes', AsyncMock(return_value=self.encoded_cover())) as read:
+                await worker._fetch_media()
+                read.assert_not_awaited()
+                worker.load_artwork = True
+                first = await worker._fetch_media()
+                self.assertIsInstance(first['thumb'], QImage)
+                self.assertNotIn('thumb', await worker._fetch_media())
+                read.assert_awaited_once()
+                props.title = 'Next track'
+                self.assertIn('thumb', await worker._fetch_media())
+                self.assertEqual(read.await_count, 2)
+                manager_type.request_async.assert_awaited_once()
+        asyncio.run(scenario())
+
+    def test_thumbnail_stream_is_closed_on_read_failure_and_size_limit(self):
+        async def scenario():
+            worker = dyn.MediaWorker()
+            stream = SimpleNamespace(size=100, close=Mock())
+            reference = SimpleNamespace(open_read_async=AsyncMock(return_value=stream))
+            reader = SimpleNamespace(load_async=AsyncMock(side_effect=OSError('read failed')),
+                                     detach_stream=Mock(), close=Mock())
+            with patch.object(dyn, 'DataReader', return_value=reader, create=True):
+                self.assertIsNone(await worker._read_thumbnail_bytes(reference))
+                reader.close.assert_called_once()
+                stream.close.assert_called_once()
+            stream.size = dyn.MAX_COVER_BYTES + 1
+            stream.close.reset_mock()
+            with patch.object(dyn, 'DataReader', create=True) as factory:
+                self.assertIsNone(await worker._read_thumbnail_bytes(reference))
+                factory.assert_not_called()
+                stream.close.assert_called_once()
+        asyncio.run(scenario())
 
 
 if __name__ == "__main__":
