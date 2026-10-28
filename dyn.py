@@ -6,14 +6,15 @@ import psutil
 from datetime import datetime
 
 from PyQt6.QtCore import (
-    Qt, QTimer, QPoint, QRect, QThread, pyqtSignal, QEvent,
+    Qt, QTimer, QPoint, QRect, QRectF, QThread, pyqtSignal, QEvent,
     QVariantAnimation, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup
 )
-from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QImage
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap, QImage, QLinearGradient, QPen
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QStackedWidget, QProgressBar
+    QLabel, QPushButton, QStackedWidget, QProgressBar, QPlainTextEdit, QFrame
 )
+from telegram_notifications import TelegramNotificationWorker
 
 # Поддержка как нового пакета winrt, так и старого winsdk
 MEDIA_BACKEND = None
@@ -38,6 +39,21 @@ class MediaWorker(QThread):
         super().__init__()
         self.running = True
         self._action = None
+        self._loop = None
+        self._task = None
+
+    def stop(self):
+        self.running = False
+        loop = self._loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._cancel_pending)
+            except RuntimeError:
+                pass  # The worker has already closed its event loop.
+
+    def _cancel_pending(self):
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
 
     def trigger_action(self, action_name):
         self._action = action_name
@@ -144,15 +160,92 @@ class MediaWorker(QThread):
         else:
             loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        self._loop = loop
 
         while self.running:
             try:
-                data = loop.run_until_complete(self._fetch_media())
+                self._task = loop.create_task(asyncio.wait_for(self._fetch_media(), timeout=5))
+                data = loop.run_until_complete(self._task)
                 self.media_updated.emit(data)
+            except asyncio.CancelledError:
+                break
             except Exception:
                 pass
-            self.msleep(800)
+            for _ in range(8):
+                if not self.running:
+                    break
+                self.msleep(100)
+        self._loop = None
         loop.close()
+
+
+class MediaButton(QPushButton):
+    """Vector controls: consistent shapes at any Windows display scale."""
+
+    def __init__(self, symbol, label, primary=False):
+        super().__init__()
+        self.symbol = symbol
+        self.primary = primary
+        self.setFixedSize(42 if primary else 34, 42 if primary else 34)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+        self.set_symbol(symbol, label)
+
+    def set_symbol(self, symbol, label):
+        self.symbol = symbol
+        self.setToolTip(label)
+        self.setAccessibleName(label)
+        self.update()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self.update()
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        if self.primary:
+            fill = QLinearGradient(0, 0, 0, self.height())
+            fill.setColorAt(0, QColor("#ff80b5" if self.underMouse() else "#ff5a9f"))
+            fill.setColorAt(1, QColor("#d91b69" if self.isDown() else "#ed287c"))
+            painter.setBrush(fill)
+            painter.setPen(Qt.PenStyle.NoPen)
+        else:
+            painter.setBrush(QColor("#45273b" if self.isDown() else
+                                    "#34303d" if self.underMouse() else "#25252e"))
+            painter.setPen(QPen(QColor("#45404e"), 1))
+        painter.drawEllipse(bounds)
+        if self.hasFocus():
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#ffc0db"), 1.5))
+            painter.drawEllipse(bounds.adjusted(2, 2, -2, -2))
+
+        painter.translate(self.width() / 2, self.height() / 2 + (1 if self.isDown() else 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#ffffff" if self.primary else "#eeeaf2"))
+        path = QPainterPath()
+        if self.symbol == "pause":
+            path.addRoundedRect(QRectF(-6, -7, 4, 14), 1.2, 1.2)
+            path.addRoundedRect(QRectF(2, -7, 4, 14), 1.2, 1.2)
+        elif self.symbol == "play":
+            path.moveTo(-4, -8)
+            path.lineTo(8, 0)
+            path.lineTo(-4, 8)
+            path.closeSubpath()
+        else:
+            if self.symbol == "prev":
+                painter.scale(-1, 1)
+            path.moveTo(-6, -6)
+            path.lineTo(3, 0)
+            path.lineTo(-6, 6)
+            path.closeSubpath()
+            path.addRoundedRect(QRectF(4, -6, 2.5, 12), 1, 1)
+        painter.drawPath(path)
 
 
 # --- Плавный минималистичный календарь в стиле iOS ---
@@ -261,6 +354,12 @@ class DesktopIslandWidget(QWidget):
         self.setWindowTitle("Desktop Island")
         self.is_expanded = False
         self._was_outside_pressed = False
+        self._closing = False
+        self._media_title = "Ничего не играет"
+        self._media_playing = False
+        self.telegram_messages = []
+        self.telegram_unseen = set()
+        self.telegram_index = 0
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
@@ -292,6 +391,11 @@ class DesktopIslandWidget(QWidget):
         self.media_worker.media_updated.connect(self.update_player_ui)
         self.media_worker.start()
 
+        self.telegram_worker = TelegramNotificationWorker(self)
+        self.telegram_worker.messages_received.connect(self.receive_telegram_messages)
+        self.telegram_worker.status_changed.connect(self.telegram_status.setText)
+        self.telegram_worker.start()
+
         self.pc_timer = QTimer(self)
         self.pc_timer.timeout.connect(self.update_pc_stats)
         self.pc_timer.start(1500)
@@ -304,7 +408,9 @@ class DesktopIslandWidget(QWidget):
 
     def _make_children_click_through(self, parent_widget):
         for child in parent_widget.findChildren(QWidget):
-            if not isinstance(child, QPushButton):
+            # Прозрачный контейнер отключает мышь и у вложенных кнопок.
+            # Пропускаем клики только через декоративные элементы.
+            if isinstance(child, (QLabel, QProgressBar)):
                 child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
     def _check_global_outside_click(self):
@@ -353,6 +459,7 @@ class DesktopIslandWidget(QWidget):
         self.mini_icon.setStyleSheet("font-size: 12px; color: #ff2a85;")
 
         self.mini_title = QLabel("Ничего не играет")
+        self.mini_title.setTextFormat(Qt.TextFormat.PlainText)
         self.mini_title.setStyleSheet("font-size: 11px; font-weight: 600; color: #ffffff;")
 
         self.mini_time = QLabel(datetime.now().strftime("%H:%M"))
@@ -376,7 +483,7 @@ class DesktopIslandWidget(QWidget):
         dots_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         dots_layout.setSpacing(6)
         self.dots = []
-        for _ in range(3):
+        for _ in range(4):
             dot = QLabel()
             dot.setFixedSize(6, 6)
             self.dots.append(dot)
@@ -386,6 +493,8 @@ class DesktopIslandWidget(QWidget):
         self.init_player_page()
         self.init_calendar_page()
         self.init_pc_stats_page()
+        self.init_telegram_page()
+        self.stack.currentChanged.connect(self.on_page_changed)
         self.update_dots(0)
 
     def init_player_page(self):
@@ -437,15 +546,11 @@ class DesktopIslandWidget(QWidget):
 
         ctrl_box = QHBoxLayout()
         ctrl_box.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ctrl_box.setSpacing(24)
+        ctrl_box.setSpacing(18)
 
-        self.btn_prev = QPushButton("|◀")
-        self.btn_play = QPushButton("▶")
-        self.btn_next = QPushButton("▶|")
-
-        self.btn_prev.setObjectName("MediaBtn")
-        self.btn_play.setObjectName("PlayBtn")
-        self.btn_next.setObjectName("MediaBtn")
+        self.btn_prev = MediaButton("prev", "Предыдущий трек")
+        self.btn_play = MediaButton("play", "Воспроизвести", primary=True)
+        self.btn_next = MediaButton("next", "Следующий трек")
 
         self.btn_prev.clicked.connect(lambda: self.media_worker.trigger_action("prev"))
         self.btn_play.clicked.connect(lambda: self.media_worker.trigger_action("play_pause"))
@@ -528,6 +633,144 @@ class DesktopIslandWidget(QWidget):
 
         self.stack.addWidget(page)
 
+    def init_telegram_page(self):
+        self.telegram_page = QWidget()
+        layout = QVBoxLayout(self.telegram_page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        heading = QHBoxLayout()
+        badge = QLabel("TG")
+        badge.setFixedSize(27, 20)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setStyleSheet("background: #269fda; border-radius: 6px; font-weight: 800;")
+        title = QLabel("TELEGRAM")
+        title.setStyleSheet("color: #6cc8f4; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
+        self.telegram_time = QLabel("")
+        self.telegram_time.setStyleSheet("color: #8a8a9e; font-size: 10px;")
+        heading.addWidget(badge)
+        heading.addWidget(title)
+        heading.addStretch()
+        heading.addWidget(self.telegram_time)
+        layout.addLayout(heading)
+
+        self.telegram_sender = QLabel("Пока нет новых сообщений")
+        self.telegram_sender.setTextFormat(Qt.TextFormat.PlainText)
+        self.telegram_sender.setMinimumWidth(0)
+        self.telegram_sender.setStyleSheet("font-size: 14px; font-weight: 700;")
+        layout.addWidget(self.telegram_sender)
+
+        self.telegram_body = QPlainTextEdit()
+        self.telegram_body.setReadOnly(True)
+        self.telegram_body.setFrameShape(QFrame.Shape.NoFrame)
+        self.telegram_body.setMinimumSize(0, 30)
+        self.telegram_body.setStyleSheet(
+            "QPlainTextEdit { background: transparent; color: #d4d4df; "
+            "font-family: 'Segoe UI'; font-size: 12px; border: none; }"
+            "QScrollBar:vertical { background: #20212a; width: 4px; }"
+            "QScrollBar::handle:vertical { background: #369bcc; min-height: 12px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+        self.telegram_body.setPlainText(
+            "В Telegram включите уведомления рабочего стола, системные уведомления Windows "
+            "и показ текста сообщений. Здесь появятся новые уведомления."
+        )
+        layout.addWidget(self.telegram_body, 1)
+
+        self.telegram_status = QLabel("Подключаем уведомления Windows…")
+        self.telegram_status.setWordWrap(True)
+        self.telegram_status.setStyleSheet("color: #8a8a9e; font-size: 9px;")
+        layout.addWidget(self.telegram_status)
+
+        footer = QHBoxLayout()
+        footer.setSpacing(5)
+        self.telegram_prev = QPushButton("‹")
+        self.telegram_prev.setToolTip("Более старое уведомление")
+        self.telegram_next = QPushButton("›")
+        self.telegram_next.setToolTip("Более новое уведомление")
+        self.telegram_counter = QLabel("0 / 0")
+        self.telegram_counter.setStyleSheet("color: #9696aa; font-size: 10px;")
+        self.telegram_prev.clicked.connect(lambda: self.browse_telegram(1))
+        self.telegram_next.clicked.connect(lambda: self.browse_telegram(-1))
+        for button in (self.telegram_prev, self.telegram_next):
+            button.setFixedSize(25, 22)
+            button.setObjectName("TelegramBtn")
+            button.setEnabled(False)
+        footer.addWidget(self.telegram_prev)
+        footer.addWidget(self.telegram_counter)
+        footer.addWidget(self.telegram_next)
+        footer.addStretch()
+        player_button = QPushButton("К плееру")
+        player_button.setObjectName("TelegramBtn")
+        player_button.setFixedHeight(22)
+        player_button.clicked.connect(lambda: self.stack.slide_to_index(0, "up"))
+        footer.addWidget(player_button)
+        layout.addLayout(footer)
+        self.telegram_page_index = self.stack.addWidget(self.telegram_page)
+
+    def receive_telegram_messages(self, messages):
+        if self._closing:
+            return
+        for message in messages:
+            self.telegram_messages.insert(0, message)
+            self.telegram_unseen.add(message["key"])
+        self.telegram_messages = self.telegram_messages[:20]
+        self.telegram_unseen.intersection_update(m["key"] for m in self.telegram_messages)
+        self.telegram_index = 0
+        self.render_telegram_message()
+        self.mark_telegram_viewed()
+        self.refresh_collapsed_view()
+        self.update_dots(self.stack.currentIndex())
+
+    def render_telegram_message(self):
+        if not self.telegram_messages:
+            return
+        message = self.telegram_messages[self.telegram_index]
+        self.telegram_sender.setText(self.telegram_sender.fontMetrics().elidedText(
+            message["sender"], Qt.TextElideMode.ElideRight,
+            self.EXPANDED_W - 58
+        ))
+        self.telegram_sender.setToolTip(message["sender"])
+        self.telegram_body.setPlainText(message["body"])
+        self.telegram_time.setText(message["time"])
+        self.telegram_counter.setText(f"{self.telegram_index + 1} / {len(self.telegram_messages)}")
+        self.telegram_prev.setEnabled(self.telegram_index + 1 < len(self.telegram_messages))
+        self.telegram_next.setEnabled(self.telegram_index > 0)
+
+    def browse_telegram(self, offset):
+        index = self.telegram_index + offset
+        if 0 <= index < len(self.telegram_messages):
+            self.telegram_index = index
+            self.render_telegram_message()
+            self.mark_telegram_viewed()
+
+    def mark_telegram_viewed(self):
+        if (self.is_expanded and self.expanded_widget.isVisible()
+                and self.stack.currentWidget() is self.telegram_page
+                and self.telegram_messages):
+            self.telegram_unseen.discard(self.telegram_messages[self.telegram_index]["key"])
+            self.refresh_collapsed_view()
+            self.update_dots(self.stack.currentIndex())
+
+    def on_page_changed(self, index):
+        self.update_dots(index)
+        self.mark_telegram_viewed()
+
+    def refresh_collapsed_view(self):
+        if self.telegram_unseen:
+            message = next(m for m in self.telegram_messages if m["key"] in self.telegram_unseen)
+            self.mini_icon.setText("TG")
+            self.mini_icon.setStyleSheet("font-size: 10px; font-weight: 800; color: #61c7fa;")
+            self.mini_title.setText(self.mini_title.fontMetrics().elidedText(
+                message["sender"], Qt.TextElideMode.ElideRight, 140
+            ))
+            self.mini_time.setText(f"+{len(self.telegram_unseen)}")
+        else:
+            self.mini_icon.setText("♫" if self._media_playing else "●")
+            self.mini_icon.setStyleSheet("font-size: 12px; color: #ff2a85;")
+            self.mini_title.setText(self._media_title[:18] + "…" if len(self._media_title) > 18 else self._media_title)
+            self.mini_time.setText(datetime.now().strftime("%H:%M"))
+
     @staticmethod
     def make_rounded_pixmap(raw_bytes: bytes, size: int = 64, radius: int = 14) -> QPixmap:
         img = QImage.fromData(raw_bytes)
@@ -561,14 +804,18 @@ class DesktopIslandWidget(QWidget):
     def update_player_ui(self, data):
         title = data["title"]
         self.title_lbl.setText(title[:25] + "..." if len(title) > 25 else title)
-        self.mini_title.setText(title[:18] + "..." if len(title) > 18 else title)
-        self.mini_icon.setText("♫" if data["is_playing"] else "●")
+        self._media_title = title
+        self._media_playing = data["is_playing"]
+        self.refresh_collapsed_view()
 
         artist = data["artist"]
         self.artist_lbl.setText(artist[:30] + "..." if len(artist) > 30 else artist)
         self.source_lbl.setText(data["source"])
 
-        self.btn_play.setText("||" if data["is_playing"] else "▶")
+        self.btn_play.set_symbol(
+            "pause" if data["is_playing"] else "play",
+            "Пауза" if data["is_playing"] else "Воспроизвести"
+        )
 
         pos = int(data["pos"])
         end = int(data["end"])
@@ -596,7 +843,7 @@ class DesktopIslandWidget(QWidget):
         self.cover_label.setText("♪")
 
     def update_pc_stats(self):
-        self.mini_time.setText(datetime.now().strftime("%H:%M"))
+        self.refresh_collapsed_view()
 
         cpu = psutil.cpu_percent()
         ram = psutil.virtual_memory()
@@ -636,6 +883,15 @@ class DesktopIslandWidget(QWidget):
         target_rect = self.calc_target_rect(self.is_expanded)
 
         if self.is_expanded:
+            if self.telegram_unseen:
+                if self.stack._animating:
+                    self.stack.anim_group.setCurrentTime(self.stack.anim_group.duration())
+                self.telegram_index = next(
+                    i for i, message in enumerate(self.telegram_messages)
+                    if message["key"] in self.telegram_unseen
+                )
+                self.render_telegram_message()
+                self.stack.setCurrentIndex(self.telegram_page_index)
             self.activateWindow()
 
         self.collapsed_widget.hide()
@@ -664,6 +920,7 @@ class DesktopIslandWidget(QWidget):
         if self.is_expanded:
             self.expanded_widget.setGeometry(0, 0, self.EXPANDED_W, self.EXPANDED_H)
             self.expanded_widget.show()
+            self.mark_telegram_viewed()
         else:
             self.collapsed_widget.setGeometry(0, 0, self.COLLAPSED_W, self.COLLAPSED_H)
             self.collapsed_widget.show()
@@ -685,13 +942,26 @@ class DesktopIslandWidget(QWidget):
             self.toggle_expand()
             event.accept()
         elif event.button() == Qt.MouseButton.RightButton:
-            self.media_worker.running = False
-            self.media_worker.wait(1500)
-            QApplication.quit()
+            self.close()
+
+    def closeEvent(self, event):
+        self._closing = True
+        self.pc_timer.stop()
+        self.outside_click_timer.stop()
+        self.media_worker.stop()
+        self.telegram_worker.requestInterruption()
+        if self.media_worker.isRunning() or self.telegram_worker.isRunning():
+            self.hide()
+            event.ignore()
+            QTimer.singleShot(100, self.close)
+            return
+        event.accept()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and self.is_expanded:
             self.collapse_island()
+        else:
+            super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         if not self.is_expanded:
@@ -699,6 +969,8 @@ class DesktopIslandWidget(QWidget):
             return
 
         delta = event.angleDelta().y()
+        if delta == 0 or self.stack._animating:
+            return
         count = self.stack.count()
         current = self.stack.currentIndex()
 
@@ -710,7 +982,6 @@ class DesktopIslandWidget(QWidget):
             direction = "up"
 
         self.stack.slide_to_index(next_idx, direction=direction)
-        self.update_dots(next_idx)
 
     def update_dots(self, active_idx):
         for i, dot in enumerate(self.dots):
@@ -718,7 +989,8 @@ class DesktopIslandWidget(QWidget):
                 dot.setStyleSheet("background-color: #ff2a85; border-radius: 3px;")
                 dot.setFixedSize(6, 14)
             else:
-                dot.setStyleSheet("background-color: #444455; border-radius: 3px;")
+                color = "#39b6f4" if i == self.telegram_page_index and self.telegram_unseen else "#444455"
+                dot.setStyleSheet(f"background-color: {color}; border-radius: 3px;")
                 dot.setFixedSize(6, 6)
 
     def apply_styles(self):
@@ -754,30 +1026,19 @@ class DesktopIslandWidget(QWidget):
                 background-color: #ff2a85;
                 border-radius: 2px;
             }
-            QPushButton#MediaBtn {
-                background: transparent;
-                color: #ff2a85;
+            QPushButton#TelegramBtn {
+                background: #203443;
+                color: #87d6ff;
                 border: none;
-                font-size: 13px;
-                font-weight: 800;
+                border-radius: 7px;
+                padding: 2px 7px;
+                font-size: 11px;
             }
-            QPushButton#MediaBtn:hover {
-                color: #ff66a8;
-            }
-            QPushButton#PlayBtn {
-                background-color: rgba(255, 42, 133, 0.18);
-                color: #ff2a85;
-                border: none;
-                border-radius: 16px;
-                font-size: 13px;
-                font-weight: 800;
-                min-width: 32px;
-                max-width: 32px;
-                min-height: 32px;
-                max-height: 32px;
-            }
-            QPushButton#PlayBtn:hover {
-                background-color: rgba(255, 42, 133, 0.35);
+            QPushButton#TelegramBtn:hover { background: #2b4c62; }
+            QPushButton#TelegramBtn:pressed { background: #34647e; }
+            QPushButton#TelegramBtn:disabled { color: #56616b; background: #20252c; }
+            QPushButton#TelegramBtn:focus {
+                border: 1px solid #87d6ff;
             }
         """)
 
